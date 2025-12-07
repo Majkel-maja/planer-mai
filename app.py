@@ -52,6 +52,14 @@ class TodoApp:
         except Exception:
             pass
 
+        # konfiguracja powiadomień
+        # co ile MILISEKUND mają być przypomnienia (tu: 30 minut)
+        self._reminder_interval_ms = 30 * 60 * 1000
+
+        # pierwsze przypomnienie po kilku sekundach od startu,
+        # żeby łatwiej było zobaczyć, że działa
+        self._start_reminders(first_delay_ms=10_000)
+
     def _setup_app_icon(self):
         """
         Ustaw ikonę aplikacji (pasek tytułu + pasek zadań na Windows).
@@ -86,6 +94,58 @@ class TodoApp:
                     pass
         except Exception:
             pass  # brak ikony nie blokuje działania
+
+    # ================== POWIADOMIENIA ==================
+    def _start_reminders(self, first_delay_ms: int | None = None):
+        """Uruchamia cykliczne przypomnienia."""
+        if first_delay_ms is None:
+            first_delay_ms = self._reminder_interval_ms
+        self.root.after(first_delay_ms, self._reminder_tick)
+
+    def _reminder_tick(self):
+        """
+        Co jakiś czas sprawdza zadania na dziś, które NIE są zrobione,
+        i wysyła powiadomienie typu:
+        'Dzisiejsze zadania: sprzątnij pokój, odrób matmę...'
+        """
+        today = date.today()
+        texts = []
+
+        for r in self.tasks:
+            if not r.is_done():
+                md = meta_to_ddmm_date(r.get_meta())
+                if md == today:
+                    txt = r.get_text().strip()
+                    if txt:
+                        texts.append("• " + txt)
+
+        if texts:
+            msg = "Dzisiejsze zadania:\n\n" + "\n".join(texts)
+            self._show_notification("Przypomnienie – Planer Maji", msg)
+
+        # znowu po ustalonym czasie
+        self.root.after(self._reminder_interval_ms, self._reminder_tick)
+
+    def _show_notification(self, title: str, message: str):
+        """
+        Próbuje wysłać powiadomienie systemowe (Windows),
+        a jeśli się nie uda – pokazuje zwykły popup (messagebox).
+        """
+        try:
+            # spróbuj użyć powiadomień Windows (jeśli jest zainstalowane win10toast)
+            from win10toast import ToastNotifier  # type: ignore
+
+            if not hasattr(self, "_toaster"):
+                self._toaster = ToastNotifier()
+            # threaded=True żeby nie blokować aplikacji
+            self._toaster.show_toast(title, message, duration=10, threaded=True)
+        except Exception:
+            # jeśli nie ma win10toast albo coś pójdzie nie tak – zwykły popup
+            try:
+                messagebox.showinfo(title, message)
+            except Exception:
+                # jak nawet popup się nie uda, to już nic nie robimy
+                pass
 
     # ================== FULLSCREEN ==================
     def _on_f11(self, _e=None):
@@ -445,6 +505,35 @@ class TodoApp:
         self.save(silent=True)
         self._refresh_view()
 
+    # ================== CZYSZCZENIE STARYCH ZADAŃ ==================
+    def _cleanup_data_items(self, data: list[dict]) -> list[dict]:
+        """
+        Usuwa zadania, które mają datę w meta wcześniejszą niż dzisiaj.
+        Zostają tylko:
+          • zadania bez daty (meta == None albo puste),
+          • zadania na dziś,
+          • zadania na przyszłość.
+        """
+        today = date.today()
+        cleaned: list[dict] = []
+
+        for item in data:
+            meta = item.get("meta")
+            d = meta_to_ddmm_date(meta)
+
+            # jeśli nie ma daty albo nie udało się sparsować – zostaw
+            if d is None:
+                cleaned.append(item)
+                continue
+
+            # jeśli data jest w przeszłości – pomijamy (czyli "auto-usuwamy")
+            if d < today:
+                continue
+
+            cleaned.append(item)
+
+        return cleaned
+
     # ================== Zapis / wczytanie ==================
     def save(self, silent=True):
         """
@@ -473,9 +562,12 @@ class TodoApp:
 
     def load(self, silent=False):
         """
-        Próbuje wczytać z bazy SQLite.
-        Jeśli w bazie nie ma jeszcze zadań – próbuje wczytać z JSON (PLIK),
-        a potem przy następnym zapisie dane trafią już do bazy.
+        ŁADUJE zapisane zadania:
+          - najpierw z bazy SQLite,
+          - jeśli tam pusto, próbuje z pliku JSON (PLIK).
+        Potem:
+          - usuwa zadania z datą w przeszłości (auto-czyszczenie),
+          - zapisuje odświeżoną listę zadań z powrotem.
         """
         # 1) Najpierw spróbuj z bazy
         data = db.load_all()
@@ -491,6 +583,10 @@ class TodoApp:
         if not data:
             return
 
+        # 3) usuń zadania z datą w przeszłości
+        data = self._cleanup_data_items(data)
+
+        # 4) zbuduj widok na podstawie wyczyszczonych danych
         for r in list(self.tasks):
             r.destroy()
         self.tasks.clear()
@@ -511,6 +607,9 @@ class TodoApp:
             )
         self._seq = max_seq + 1 if max_seq >= 0 else len(self.tasks)
         self._refresh_view()
+
+        # 5) zapisz z powrotem po wyczyszczeniu (żeby baza/JSON też były odświeżone)
+        self.save(silent=True)
 
     def exit_app(self):
         self.save()
